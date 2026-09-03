@@ -6,6 +6,41 @@ import machine
 from pixel_colors import COLORS
 from pixel_strip import PixelStrip
 
+class ScheduledEvent:
+    def __init__(self, pixel_id, time_us, color, brightness):
+        self.pixel_id = pixel_id
+        self.time_us = time_us
+        self.color = color
+        self.brightness = brightness
+
+
+
+class MonotonicMicros:
+    """Non-wrapping 64-bit microsecond counter built on time.ticks_us().
+
+    ticks_us() itself wraps at the port's TICKS_PERIOD (~17.9 min on RP2).
+    This accumulates ticks_diff() deltas into a Python big-int, so the value
+    never wraps in any practical timescale while keeping 1 us resolution.
+
+    CONTRACT: read() must be called at least once per ~8 min (half the wrap
+    period) or a wrap is missed and time is silently lost. The controller's
+    main loop calls it every iteration, so the only risk is a handler that
+    blocks longer than that without reading -- a future scheduler's long
+    wait loop must therefore call read() (or ticks_diff) as it spins.
+
+    Not thread-safe: read() mutates state and must be called from one thread.
+    """
+
+    def __init__(self):
+        self._last = time.ticks_us()
+        self._acc = 0
+
+    def read(self):
+        now = time.ticks_us()
+        self._acc += time.ticks_diff(now, self._last)
+        self._last = now
+        return self._acc
+
 
 class PixelController:
     """Serial-driven controller for an addressable pixel strip on a Pico.
@@ -16,6 +51,7 @@ class PixelController:
       CLOSE             -> PICO_CLOSED, then re-enters handshake
       INITSTRIP:pin:n   -> STRIP_INITIALIZED
       PIXEL:id:color:b  -> DONE
+      SYNC              -> PICO_TIME:<us>     (non-wrapping 64-bit microseconds)
     Errors are reported as a single 'ERROR:...' line; the host should
     tolerate any unrecognised line rather than aborting.
     """
@@ -25,6 +61,10 @@ class PixelController:
         self.blink_interval_ms = blink_interval_ms
         self.loop_sleep_ms = loop_sleep_ms
         self.pixel_strip = None
+        self._clock64 = MonotonicMicros()
+        self._scheduled_events = []  # List of ScheduledEvent, sorted by time_us
+        self.coalesce_window_us = 50  # Time window to coalesce events before execution
+        self._frame_latch_offset_us = 0
 
         # Keyword -> handler. Dispatch replaces the sequential-if chain,
         # so control flow is explicit and CLOSE can't fall through.
@@ -34,6 +74,8 @@ class PixelController:
             "CLOSE": self._handle_close,
             "INITSTRIP": self._handle_initstrip,
             "PIXEL": self._handle_pixel,
+            "SYNC": self._handle_sync,
+            "SCHEDULE": self._handle_schedule,
         }
 
     # --- I/O helpers -----------------------------------------------------
@@ -49,7 +91,11 @@ class PixelController:
     # --- handshake -------------------------------------------------------
 
     def wait_for_handshake(self):
-        """Block until the host sends PING, blinking the onboard LED."""
+        """Block until the host sends PING, blinking the onboard LED.
+
+        Uses ticks_ms/ticks_diff: time.time() has 1 s resolution on the
+        RP2040, so the sub-second blink interval would otherwise not work.
+        """
         last = time.ticks_ms()
         while True:
             if self._input_ready() and self._readline() == "PING":
@@ -74,7 +120,6 @@ class PixelController:
         except (ValueError, IndexError) as exc:
             # Malformed command must not kill the loop mid-experiment.
             print("ERROR:bad_command:{}".format(exc))
-                        
 
     def _handle_ping(self, parts):
         # PING during the main loop just re-acks; the actual handshake
@@ -83,6 +128,14 @@ class PixelController:
 
     def _handle_beat(self, parts):
         print("PICO_ALIVE")
+
+    def _handle_sync(self, parts):
+        # Capture Pico time as early as possible, before formatting/printing,
+        # so reply-path latency does not bias the timestamp. The value is a
+        # non-wrapping 64-bit microsecond count, so the host needs no modular
+        # arithmetic and the scheduler can compare deadlines with plain >=.
+        t = self._clock64.read()
+        print("PICO_TIME:{}".format(t))
 
     def _handle_close(self, parts):
         print("PICO_CLOSED")
@@ -97,6 +150,27 @@ class PixelController:
         animate = bool(int(parts[3])) if len(parts) > 3 else True
         self.pixel_strip = PixelStrip(pin_num, num_pixels, animate=animate)
         print("STRIP_INITIALIZED")
+
+    def _handle_schedule(self, parts):
+        # SCHEDULE:time_us:id:color:brightness  e.g. SCHEDULE:1000000:red:1
+        time_us = int(parts[1])
+        pixel_id = int(parts[2])        
+        color = parts[3]
+        if color not in COLORS:
+            print("ERROR:unknown_color:{}".format(color))
+            return
+        brightness = float(parts[4])
+        event = ScheduledEvent(pixel_id, time_us, color, brightness)
+        self._scheduled_events.append(event)
+        self._scheduled_events.sort(key=lambda e: e.time_us)
+        
+        if len(parts) > 5:
+            t_pixel_off = int(parts[5]) + time_us
+            event_off = ScheduledEvent(pixel_id, t_pixel_off, "black", 0)
+            self._scheduled_events.append(event_off)
+            self._scheduled_events.sort(key=lambda e: e.time_us)
+        print("SCHEDULED")
+            
 
     def _handle_pixel(self, parts):
         # PIXEL:id:color:brightness  e.g. PIXEL:0:red:1
@@ -120,13 +194,55 @@ class PixelController:
 
     # --- main loop -------------------------------------------------------
 
+    def _handle_scheduled_event(self, events):
+        """Fire a coalesced batch of ScheduledEvents in one frame.
+
+        events[0].time_us is the earliest requested visible-onset time in
+        this batch (run() already grouped everything else in it to within
+        coalesce_window_us of that). The underlying write() must START
+        frame_latch_offset_us before that time, since WS2812/SK6812 only
+        latches the new colors once the full frame has shifted out and the
+        reset gap is seen -- see the note on SET_LATCH_OFFSET.
+        """
+        if self.pixel_strip is None:
+            return
+        target_us = events[0].time_us - self._frame_latch_offset_us
+
+        # Spin (no sleep, no serial) until write() must begin. run() only
+        # calls this once the window is already imminent, so this spin is
+        # short -- but it's still a hard busy-loop, so nothing else runs
+        # during it, same tradeoff as the rest of the fine-spin design.
+        while self._clock64.read() < target_us:
+            pass
+
+        for event in events:
+            if event.color not in COLORS:
+                # Shouldn't happen -- _handle_schedule already validated the
+                # on-event's color, and off-events use the fixed "black" key.
+                # Guard anyway so one bad entry can't abort the whole batch.
+                continue
+            pixel_color = self._apply_brightness(COLORS[event.color], event.brightness)
+            self.pixel_strip.set_pixel_buffered(event.pixel_id, pixel_color)
+
+        self.pixel_strip.show()  # blocking; latch happens when this returns
+    
     def run(self):
         self.wait_for_handshake()
         while True:
+            # Advance the 64-bit clock every iteration so it can never miss a
+            # ticks_us() wrap while the loop is alive.
+            now = self._clock64.read()
             if self._input_ready():
                 line = self._readline()
                 if line:
                     self.process_command(line)
+            if self._scheduled_events:
+                time_to_next_event = self._scheduled_events[0].time_us - now
+                if time_to_next_event <= 3000: # 3 ms before the next event jump into the handler                    
+                    events = [self._scheduled_events.pop(0)]
+                    while len(self._scheduled_events) > 0 and self._scheduled_events[0].time_us - events[0].time_us <= self.coalesce_window_us:
+                        events.append(self._scheduled_events.pop(0))                    
+                    self._handle_scheduled_event(events)
             time.sleep_ms(self.loop_sleep_ms)
 
 

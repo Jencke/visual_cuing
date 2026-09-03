@@ -24,9 +24,16 @@ class PixelStrip:
             self.strip[i] = (0, 0, 0)
             self.strip.write()
             time.sleep_ms(step_ms)
-
-    def set_pixel(self, index, color):
+    
+    def set_pixel_buffered(self, index, color):
         if not 0 <= index < len(self.strip):
             raise IndexError("pixel index {} out of range".format(index))
         self.strip[index] = color
+    
+    def show(self):
         self.strip.write()
+        
+    def set_pixel(self, index, color):
+        """Set a pixel color and immediately latch it to the strip."""
+        self.set_pixel_buffered(index, color)
+        self.show()
