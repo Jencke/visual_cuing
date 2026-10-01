@@ -208,21 +208,15 @@ class PixelController:
             return
         target_us = events[0].time_us - self._frame_latch_offset_us
 
-        # Spin (no sleep, no serial) until write() must begin. run() only
-        # calls this once the window is already imminent, so this spin is
-        # short -- but it's still a hard busy-loop, so nothing else runs
-        # during it, same tradeoff as the rest of the fine-spin design.
-        while self._clock64.read() < target_us:
-            pass
-
         for event in events:
             if event.color not in COLORS:
-                # Shouldn't happen -- _handle_schedule already validated the
-                # on-event's color, and off-events use the fixed "black" key.
-                # Guard anyway so one bad entry can't abort the whole batch.
                 continue
             pixel_color = self._apply_brightness(COLORS[event.color], event.brightness)
             self.pixel_strip.set_pixel_buffered(event.pixel_id, pixel_color)
+
+
+        while self._clock64.read() < target_us:
+            pass
 
         self.pixel_strip.show()  # blocking; latch happens when this returns
     
