@@ -10,7 +10,7 @@ class ScheduledEvent:
     def __init__(self, pixel_id, time_us, color, brightness):
         self.pixel_id = pixel_id
         self.time_us = time_us
-        self.color = color
+        self.color = color  # (r, g, b), resolved when the command arrives
         self.brightness = brightness
 
 
@@ -51,7 +51,9 @@ class PixelController:
       CLOSE             -> PICO_CLOSED, then re-enters handshake
       INITSTRIP:pin:n   -> STRIP_INITIALIZED
       PIXEL:id:color:b  -> DONE
+      SCHEDULE:t_us:id:color:b[:dur_us] -> SCHEDULED
       SYNC              -> PICO_TIME:<us>     (non-wrapping 64-bit microseconds)
+    color is a name from pixel_colors.COLORS or 'r,g,b' with values 0-255.
     Errors are reported as a single 'ERROR:...' line; the host should
     tolerate any unrecognised line rather than aborting.
     """
@@ -151,13 +153,27 @@ class PixelController:
         self.pixel_strip = PixelStrip(pin_num, num_pixels, animate=animate)
         print("STRIP_INITIALIZED")
 
+    @staticmethod
+    def _parse_color(text):
+        """Color name or 'r,g,b' (0-255) -> (r, g, b), or None if invalid."""
+        if text in COLORS:
+            return COLORS[text]
+        try:
+            rgb = tuple(int(c) for c in text.split(","))
+        except ValueError:
+            return None
+        if len(rgb) != 3 or not all(0 <= c <= 255 for c in rgb):
+            return None
+        return rgb
+
     def _handle_schedule(self, parts):
-        # SCHEDULE:time_us:id:color:brightness  e.g. SCHEDULE:1000000:red:1
+        # SCHEDULE:time_us:id:color:brightness[:duration_us]
+        #   e.g. SCHEDULE:1000000:0:red:1  or  SCHEDULE:1000000:0:255,0,0:1:100000
         time_us = int(parts[1])
-        pixel_id = int(parts[2])        
-        color = parts[3]
-        if color not in COLORS:
-            print("ERROR:unknown_color:{}".format(color))
+        pixel_id = int(parts[2])
+        color = self._parse_color(parts[3])
+        if color is None:
+            print("ERROR:unknown_color:{}".format(parts[3]))
             return
         brightness = float(parts[4])
         event = ScheduledEvent(pixel_id, time_us, color, brightness)
@@ -166,24 +182,24 @@ class PixelController:
         
         if len(parts) > 5:
             t_pixel_off = int(parts[5]) + time_us
-            event_off = ScheduledEvent(pixel_id, t_pixel_off, "black", 0)
+            event_off = ScheduledEvent(pixel_id, t_pixel_off, (0, 0, 0), 0)
             self._scheduled_events.append(event_off)
             self._scheduled_events.sort(key=lambda e: e.time_us)
         print("SCHEDULED")
             
 
     def _handle_pixel(self, parts):
-        # PIXEL:id:color:brightness  e.g. PIXEL:0:red:1
+        # PIXEL:id:color:brightness  e.g. PIXEL:0:red:1  or  PIXEL:0:255,0,0:1
         if self.pixel_strip is None:
             print("ERROR:strip_not_initialized")
             return
         pixel_id = int(parts[1])
-        color = parts[2]
-        if color not in COLORS:
-            print("ERROR:unknown_color:{}".format(color))
+        color = self._parse_color(parts[2])
+        if color is None:
+            print("ERROR:unknown_color:{}".format(parts[2]))
             return
         brightness = float(parts[3])
-        pixel_color = self._apply_brightness(COLORS[color], brightness)
+        pixel_color = self._apply_brightness(color, brightness)
         self.pixel_strip.set_pixel(pixel_id, pixel_color)
         print("DONE")
 
@@ -209,9 +225,7 @@ class PixelController:
         target_us = events[0].time_us - self._frame_latch_offset_us
 
         for event in events:
-            if event.color not in COLORS:
-                continue
-            pixel_color = self._apply_brightness(COLORS[event.color], event.brightness)
+            pixel_color = self._apply_brightness(event.color, event.brightness)
             self.pixel_strip.set_pixel_buffered(event.pixel_id, pixel_color)
 
 
